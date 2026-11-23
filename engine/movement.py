@@ -182,6 +182,13 @@ def _keep_off_walls(unit: Unit, grid: Grid, block_bush: bool) -> None:
     r = min(getattr(unit, "radius", 0.35), _WALL_R_MAX)
     px, py = unit.pos.x, unit.pos.y
     shape = grid._shape_on
+    if shape:
+        nv = grid.native_view()
+        if nv is not None:                   # stesso calcolo, in Rust (pokemoba_native)
+            qx, qy = nv.keep_off_walls(px, py, r, block_bush)
+            if qx != px or qy != py:
+                unit.pos = Vec2(qx, qy)
+            return
     cx, cy = math.floor(px), math.floor(py)
     for _ in range(2):
         moved = False
@@ -257,6 +264,19 @@ def resolve_collisions(units: list[Unit], grid: Grid, iterations: int = 2,
     # Chi e' in volo (air_z > 0: lanciato in aria, salti, Taxi Volante) passa
     # sopra le altre unita': non spinge e non viene spinto.
     units = [u for u in units if getattr(u, "air_z", 0.0) <= 0.0]
+    nv = grid.native_view() if grid is not None else None
+    if nv is not None:
+        # Stesso algoritmo (griglia spaziale da 2 tile, stesso ordine di visita e
+        # di spinta), in Rust: si riscrivono solo le posizioni cambiate.
+        xs = [u.pos.x for u in units]
+        ys = [u.pos.y for u in units]
+        nxs, nys = nv.resolve_collisions(
+            xs, ys, [u.radius for u in units], [u.id for u in units],
+            [bool(getattr(u, "bush_blocks", False)) for u in units], iterations)
+        for u, x0, y0, x1, y1 in zip(units, xs, ys, nxs, nys):
+            if x1 != x0 or y1 != y0:
+                u.pos = Vec2(x1, y1)
+        return
     for _ in range(iterations):
         spatial.rebuild(units)
         seen: set[tuple[int, int]] = set()

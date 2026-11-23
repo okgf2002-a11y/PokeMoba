@@ -12,6 +12,21 @@ from dataclasses import dataclass
 
 import numpy as np
 
+# Estensione Rust facoltativa (native/, `maturin develop --release`): stessi
+# risultati bit per bit del codice Python, solo piu' veloce. Se manca (o con
+# POKEMOBA_NO_NATIVE=1) si usa il Python qui sotto.
+import os as _os
+try:
+    if _os.environ.get("POKEMOBA_NO_NATIVE"):
+        raise ImportError
+    import pokemoba_native as _native
+except ImportError:
+    _native = None
+
+# Direzioni di movement._shape_push (stessa espressione: stessi float).
+_SHAPE_DIRS = tuple((math.cos(i * math.pi / 8), math.sin(i * math.pi / 8))
+                    for i in range(16))
+
 # Tipi di tile
 TILE_FLOOR = 0        # erba / giungla
 TILE_WALL = 1         # muro di bordo (bloccante, permanente)
@@ -27,6 +42,8 @@ BLOCKING = {TILE_WALL, TILE_JUNGLE_WALL, TILE_PILLAR}
 
 # Da quanti campioni line_of_sight passa a numpy (sotto, il ciclo Python costa meno).
 _LOS_NUMPY_MIN = 24
+# Voci massime nella memoria di line_of_sight (si svuota tutta quando si riempie).
+_LOS_MEMO_MAX = 65536
 
 
 class _Row(list):
@@ -63,6 +80,9 @@ class Grid:
     # Sagoma dei muri (enable_wall_shape): spenta di default (test, mappe semplici).
     _shape_on = False
     _shape_ver = None
+    _los_memo = None          # (versione, {argomenti: risultato})
+    _los_sat_cache = None     # (versione, (somme, larghezza) senza / con cespugli)
+    _nv = None                # (versione, pokemoba_native.GridView)
 
     # Ogni scrittura nella griglia (tiles[y][x] = ..., una riga o tutta la matrice)
     # passa da qui o da _Row/_Rows e fa avanzare `_ver`: le maschere numpy usate da
@@ -74,6 +94,15 @@ class Grid:
             value = rows
             object.__setattr__(self, "_ver", getattr(self, "_ver", 0) + 1)
         object.__setattr__(self, name, value)
+
+    def __getstate__(self):
+        # La vista Rust (cache) non si serializza: si ricostruisce alla prima query.
+        st = self.__dict__.copy()
+        st.pop("_nv", None)
+        return st
+
+    def __setstate__(self, st):
+        self.__dict__.update(st)
 
     def _block_masks(self):
         """(bloccanti, bloccanti + cespugli) come maschere numpy [y, x], in cache.
@@ -176,6 +205,22 @@ class Grid:
         object.__setattr__(self, "_shape_bush", bush)
         object.__setattr__(self, "_shape_ver", self._ver)
 
+    def native_view(self):
+        """pokemoba_native.GridView della griglia attuale (sagoma dei muri attiva),
+        o None senza estensione / senza sagoma. Si rifa' quando la griglia cambia."""
+        if _native is None or not self._shape_on:
+            return None
+        nv = self._nv
+        if nv is not None and nv[0] == self._ver:
+            return nv[1]
+        if self._shape_ver != self._ver:
+            self._shape_sync()
+        tiles = np.array(self.tiles, dtype=np.uint8).tobytes()
+        v = _native.GridView(self.width, self.height, tiles, self._shape_b,
+                             self._shape_any_b, _SHAPE_DIRS)
+        object.__setattr__(self, "_nv", (self._ver, v))
+        return v
+
     def shape_blocked(self, px: float, py: float) -> bool:
         """True se il punto sta dentro la sagoma disegnata di un muro (False se la
         sagoma non e' attiva o se il punto e' fuori mappa)."""
@@ -275,6 +320,32 @@ class Grid:
 
     def line_of_sight(self, ax: float, ay: float, bx: float, by: float,
                       block_bush: bool = False) -> bool:
+        """True se il segmento A->B non attraversa tile bloccanti (vedi _los_compute).
+
+        MEMORIA: il risultato dipende solo dagli argomenti e dalla griglia, quindi
+        si tiene per versione della griglia. Circa meta' delle chiamate di una
+        partita ripete una domanda gia' fatta (unita' ferme, minion che puntano
+        lo stesso waypoint): la risposta e' identica, solo non si ricalcola."""
+        memo = self._los_memo
+        if memo is None or memo[0] != self._ver:
+            memo = (self._ver, {})
+            object.__setattr__(self, "_los_memo", memo)
+        d = memo[1]
+        key = (ax, ay, bx, by, block_bush)
+        r = d.get(key)
+        if r is None:
+            nv = self.native_view() if self._shape_on else None
+            if nv is not None:
+                r = nv.line_of_sight(ax, ay, bx, by, block_bush)
+            else:
+                r = self._los_compute(ax, ay, bx, by, block_bush)
+            if len(d) >= _LOS_MEMO_MAX:
+                d.clear()
+            d[key] = r
+        return r
+
+    def _los_compute(self, ax: float, ay: float, bx: float, by: float,
+                     block_bush: bool = False) -> bool:
         """True se il segmento A->B non attraversa tile bloccanti.
 
         Campiona il segmento a passi fini; sufficiente per lo smoothing dei
@@ -324,8 +395,29 @@ class Grid:
         cespugli per tile, muri sulla maschera fine."""
         if self._shape_ver != self._ver:
             self._shape_sync()
-        steps = int(dist * 4) + 1
         w, h = self.width, self.height
+        # USCITA RAPIDA esatta: se il rettangolo che contiene il segmento (piu' una
+        # cella di margine per gli arrotondamenti) non ha nessuna cella bloccante,
+        # nessun campione puo' esserlo -> True senza campionare (tabella delle
+        # somme, O(1)). Solo con gli estremi ben dentro la mappa: vicino al bordo
+        # decide il campionamento qui sotto, come prima.
+        x0 = ax if dx >= 0.0 else ax + dx
+        y0 = ay if dy >= 0.0 else ay + dy
+        x1 = x0 + abs(dx)
+        y1 = y0 + abs(dy)
+        if x0 > 1e-6 and y0 > 1e-6 and x1 < w - 1e-6 and y1 < h - 1e-6:
+            sat, sw = self._los_sat(block_bush)
+            c0 = int(x0 * 8) - 1
+            c1 = int(x1 * 8) + 2
+            r0 = (int(y0 * 8) - 1) * sw
+            r1 = (int(y1 * 8) + 2) * sw
+            if c0 < 0: c0 = 0
+            if r0 < 0: r0 = 0
+            if c1 > sw - 1: c1 = sw - 1
+            if r1 > len(sat) - sw: r1 = len(sat) - sw
+            if sat[r1 + c1] - sat[r0 + c1] - sat[r1 + c0] + sat[r0 + c0] == 0:
+                return True
+        steps = int(dist * 4) + 1
         if steps >= _LOS_NUMPY_MIN:
             t = np.arange(steps + 1) / steps
             xf = ax + dx * t
@@ -351,15 +443,33 @@ class Grid:
                 return False
         return True
 
+    def _los_sat(self, block_bush):
+        """Tabella delle somme (summed-area table) delle celle FINI bloccanti per
+        line_of_sight: sagoma dei muri + pilastri (+ cespugli), lista piatta di
+        (H*8+1) x (W*8+1) interi, larghezza della riga. In cache per versione."""
+        c = self._los_sat_cache
+        if c is None or c[0] != self._ver:
+            kp = self._kind_mask(False)
+            kb = self._kind_mask(True)
+            out = []
+            for k in (kp, kb):
+                blk = self._shape_np | np.repeat(np.repeat(k, 8, 0), 8, 1)
+                s = np.zeros((blk.shape[0] + 1, blk.shape[1] + 1), np.int64)
+                np.cumsum(np.cumsum(blk, 0, dtype=np.int64), 1, out=s[1:, 1:])
+                out.append((s.ravel(), s.shape[1]))
+            c = (self._ver, out[0], out[1])
+            object.__setattr__(self, "_los_sat_cache", c)
+        return c[2] if block_bush else c[1]
+
     def _kind_mask(self, block_bush):
         """Pilastri (+ cespugli) per tile come maschera numpy, in cache per versione."""
-        key = (self._ver, block_bush)
+        # Tutte e due le maschere per versione: con una sola voce (versione, cespugli)
+        # le chiamate alternate con/senza cespugli rifacevano np.array dell'intera
+        # griglia quasi a ogni chiamata (~10% del tempo di una partita 5v5).
         c = getattr(self, "_kind_cache", None)
-        if c is None or c[0] != key:
+        if c is None or c[0] != self._ver:
             arr = np.array(self.tiles, dtype=np.int16).reshape(self.height, self.width)
             m = arr == TILE_PILLAR
-            if block_bush:
-                m = m | (arr == TILE_BUSH)
-            c = (key, m)
+            c = (self._ver, m, m | (arr == TILE_BUSH))
             object.__setattr__(self, "_kind_cache", c)
-        return c[1]
+        return c[2] if block_bush else c[1]
