@@ -1,5 +1,21 @@
 [
   {
+    "version": "3.2.2",
+    "date": "2026-11-27",
+    "title": "Opzioni in partita, gittata d'attacco e inseguimenti più fluidi",
+    "items": [
+      "ESC in partita: chiude il negozio; se non c'è niente di aperto apre le opzioni e, premuto di nuovo, le chiude. Vale contro i bot, in allenamento, nel tutorial e online.",
+      "Opzioni in partita: volume, schermo intero, FPS, camera, lancio rapido (smart cast) e tasti si cambiano senza uscire.",
+      "Per lasciare una partita usa \"Esci dalla partita\" nelle opzioni: ESC premuto per sbaglio non ti fa più uscire. Le opzioni non mettono in pausa; se ospiti online, uscendo chiudi la partita per tutti.",
+      "Gittata dell'attacco base: una linea attorno al tuo Pokémon mostra fin dove arriva. La vedi solo tu, tiene conto di oggetti e passive e sparisce mentre miri una mossa.",
+      "Nuova opzione \"Mostra gittata attacco base\", nel menu e in partita, per accendere o spegnere la linea.",
+      "Inseguimento: se il bersaglio sparisce per un attimo (cespuglio, muro della giungla) il tuo Pokémon continua a seguirlo per meno di un secondo, senza colpirlo finché non torna visibile.",
+      "Movimento: corretto l'avanti e indietro del tuo Pokémon mentre aggira gli ostacoli.",
+      "Le opzioni stanno tutte nello schermo anche con la finestra piccola.",
+      "Online: per vedere le novità aggiornate il gioco tutti, sia chi ospita sia gli amici."
+    ]
+  },
+  {
     "version": "3.2.1",
     "date": "2026-11-27",
     "title": "Motore più veloce e movimento migliorato",
