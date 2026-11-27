@@ -43,9 +43,9 @@ class TestChaseLock(unittest.TestCase):
         self.assertAlmostEqual(self.p.pos.x, x, places=3)   # fermo: niente re-lock
 
     def test_unreachable_target_is_given_up(self):
-        for y in range(44, 52):
+        for y in range(len(self.world.grid.tiles)):
             for x in range(29, 40):
-                self.world.grid.tiles[y][x] = 1        # blocco di muro attorno al bersaglio
+                self.world.grid.tiles[y][x] = 1        # muro da bordo a bordo: irraggiungibile
         self.t.pos = Vec2(34.5, 47.5)
         self.sim.queue_command(AttackCommand(seq=1, entity_id=self.p.id, target_id=self.t.id))
         self.run_ticks(int(4.0 / DT))
@@ -128,6 +128,49 @@ class TestChaseLock(unittest.TestCase):
             self.vis()
             dropped = dropped or self.match._chase_skipped(self.p) == self.t.id
         self.assertTrue(dropped)                           # a guinzaglio finito lo molla
+
+    def test_target_blinking_in_fog_does_not_make_it_oscillate(self):
+        """Il bersaglio sparisce/riappare (cespuglio, giungla): niente avanti-indietro
+        fra lui e il punto cliccato, e nella nebbia non viene colpito."""
+        self.t.pos = Vec2(31.5, 45.0)
+        real = self.match.vision.is_enemy_visible
+        self.tick = 0
+        self.match.vision.is_enemy_visible = (
+            lambda team, eid: real(team, eid) and (self.tick // 4) % 2 == 0)
+        self.sim.queue_command(AttackMoveCommand(seq=1, entity_id=self.p.id, x=40.5, y=49.5))
+        xs, hits = [], 0
+        for _ in range(90):
+            self.tick += 1
+            was = self.p.aa_active
+            self.sim.step()
+            self.vis()
+            xs.append((self.p.pos.x, self.p.pos.y))
+            if self.p.aa_active and not was and (self.tick // 4) % 2 == 1:
+                hits += 1                                  # attacco iniziato nella nebbia
+        self.assertEqual(hits, 0)
+        back = sum(1 for a, b in zip(xs, xs[1:]) if b[0] < a[0] - 1e-6)
+        self.assertEqual(back, 0)                          # mai indietro
+
+    def test_astar_chase_never_walks_back_to_passed_waypoints(self):
+        for y in range(40, 56):
+            for x in range(33, 36):
+                self.world.grid.tiles[y][x] = 1            # muro: bisogna girarci attorno
+        self.t.pos = Vec2(40.5, 47.5)
+        self.sim.queue_command(AttackCommand(seq=1, entity_id=self.p.id, target_id=self.t.id))
+        pts = []
+        for _ in range(int(6.0 / DT)):
+            self.sim.step()
+            self.vis()
+            pts.append((self.p.pos.x, self.p.pos.y))
+        import math
+        d0 = math.hypot(pts[0][0] - 33.0, pts[0][1] - 40.0)
+        back = 0
+        for a, b, c in zip(pts, pts[3:], pts[6:]):         # inversioni nette di direzione
+            u = (b[0] - a[0], b[1] - a[1]); v = (c[0] - b[0], c[1] - b[1])
+            nu, nv = math.hypot(*u), math.hypot(*v)
+            if nu > 0.05 and nv > 0.05 and (u[0] * v[0] + u[1] * v[1]) / (nu * nv) < -0.5:
+                back += 1
+        self.assertEqual(back, 0)
 
 
 if __name__ == "__main__":

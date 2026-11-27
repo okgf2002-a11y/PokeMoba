@@ -220,6 +220,7 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
         # Bersaglio che il giocatore ha mollato di proposito (ordine di movimento) o
         # che non si riesce a raggiungere: da fermo non lo si reinsegue per un po'.
         self._chase_skip: dict[int, tuple] = {}   # id Pokemon -> (id bersaglio, fino a)
+        self._lock_seen: dict[int, tuple] = {}    # id Pokemon -> (id bersaglio, ultima volta visto)
         self._chase_prog: dict[int, list] = {}    # id Pokemon -> stato di _chase_stalled
         data_dir = Path(__file__).resolve().parent.parent / "data"
         self.types = TypeChart.load(data_dir / "types.json")
@@ -567,9 +568,14 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
         if p.order == "attack":
             # Clic su un nemico: lo insegue finché non è a portata, poi attacca.
             t = self.world.get(p.order_target_id) if p.order_target_id is not None else None
-            if self._aa_target_ok(p, t) and not self._chase_stalled(p, t):
-                p.target_id = t.id
-                self._chase_or_hold(p, t, dt)
+            lk = self._lock_state(p, t)
+            if lk and not self._chase_stalled(p, t):
+                if lk == 1:
+                    p.target_id = t.id
+                    self._chase_or_hold(p, t, dt)
+                else:                          # sparito un attimo: si continua senza colpirlo
+                    p.target_id = None
+                    self._chase_ghost(p, t, dt)
                 return
             if t is not None and getattr(t, "alive", False):
                 self.skip_chase(p, t.id)   # irraggiungibile: da fermo non lo si reinsegue
@@ -588,8 +594,10 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
             if am is None or am[0] is not p.order_point:
                 am = st["am"] = [p.order_point, None]
             pt = p.order_point or p.pos
-            t = self.world.get(p.target_id) if p.target_id is not None else None
-            keep = (self._aa_target_ok(p, t, p.champs_only)
+            tid = p.target_id if p.target_id is not None else st.get("lock_id")
+            t = self.world.get(tid) if tid is not None else None
+            lk = self._lock_state(p, t, p.champs_only)
+            keep = (lk != 0
                     and p.pos.dist(t.pos) <= reach + t.radius + AMOVE_EXTRA + AMOVE_DROP_EXTRA)
             if keep and not self._within_attack(p, t):
                 # Inseguimento a guinzaglio: oltre AMOVE_CHASE_LEASH tile dal punto
@@ -601,13 +609,20 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
             if not keep:
                 t = self._acquire_near_point(p, reach + AMOVE_EXTRA, pt, p.champs_only,
                                              self._chase_skipped(p), ahead=pt)
+                lk = 1 if t is not None else 0
             if t is not None:
-                if am[1] is None or t.id != p.target_id:
+                if am[1] is None or t.id != tid:
                     am[1] = Vec2(p.pos.x, p.pos.y)
-                p.target_id = t.id
-                self._chase_or_hold(p, t, dt)
+                st["lock_id"] = t.id
+                if lk == 1:
+                    p.target_id = t.id
+                    self._chase_or_hold(p, t, dt)
+                else:
+                    p.target_id = None
+                    self._chase_ghost(p, t, dt)
                 return
             am[1] = None
+            st.pop("lock_id", None)
             p.target_id = None
             # move_dest: il punto raggiungibile verso il clic (vedi Simulation).
             dest = p.move_dest if p.move_dest is not None else p.order_point
@@ -628,32 +643,41 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
             p.idle_anchor = Vec2(p.pos.x, p.pos.y)
         can_chase = not hold and p.pos.dist(p.idle_anchor) <= IDLE_CHASE_LEASH
         acq = reach + (0.0 if hold else ACQUIRE_EXTRA)
-        t = self.world.get(p.target_id) if p.target_id is not None else None
+        tid = p.target_id if p.target_id is not None else st.get("lock_id")
+        t = self.world.get(tid) if tid is not None else None
         skip = self._chase_skipped(p)
         if t is not None and t.id == skip and not self._within_attack(p, t):
             t = None
-        if not (self._aa_target_ok(p, t) and (self._within_attack(p, t)
-                                               or (can_chase and p.pos.dist(t.pos)
-                                                   <= acq + t.radius + 1.0))):
+        lk = self._lock_state(p, t)
+        if not (lk and (self._within_attack(p, t)
+                        or (can_chase and p.pos.dist(t.pos) <= acq + t.radius + 1.0))):
             t = self._acquire_near_point(p, acq, p.pos, False, skip)
+            lk = 1 if t is not None else 0
+        ghost = lk == 2
         if (t is not None and st.get("idle_chase") and not self._within_attack(p, t)
                 and self._chase_stalled(p, t)):
             self.skip_chase(p, t.id)        # non ci arriva (muro, angolo): lascia stare
             st.pop("idle_chase", None)
             p.stop()
             t = None
-        if t is not None and (self._within_attack(p, t)
-                              or (p.aa_active and p.aa_target_id == t.id)):
+        if t is not None:
+            st["lock_id"] = t.id
+        if t is not None and not ghost and (self._within_attack(p, t)
+                                            or (p.aa_active and p.aa_target_id == t.id)):
             p.target_id = t.id
             if st.pop("idle_chase", False):
                 p.stop()
             self._face(p, t)
         elif t is not None and can_chase:
-            p.target_id = t.id
+            p.target_id = None if ghost else t.id
             st["idle_chase"] = True
-            self._chase(p, t, dt)
+            if ghost:
+                self._chase_ghost(p, t, dt)
+            else:
+                self._chase(p, t, dt)
         else:
             # Limite d'inseguimento: l'attacco automatico non trascina per la mappa.
+            st.pop("lock_id", None)
             p.target_id = None
             if st.pop("idle_chase", False):
                 p.stop()
@@ -670,6 +694,29 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
         if isinstance(t, Unit) and not self.vision.is_enemy_visible(p.team, t.id):
             return False
         return True
+
+    LOCK_GRACE = 0.8          # s: un bersaglio che sparisce un attimo (cespuglio, muro di
+                              # giungla) resta agganciato: niente oscillazione col clic
+
+    def _lock_state(self, p, t, champs_only: bool = False) -> int:
+        """0 = nessun aggancio, 1 = bersaglio valido e visto, 2 = visto fino a un attimo
+        fa (si continua a muoversi verso di lui ma NON lo si colpisce nella nebbia)."""
+        if self._aa_target_ok(p, t, champs_only):
+            self._lock_seen[p.id] = (t.id, self.time)
+            return 1
+        if (t is None or not getattr(t, "alive", False) or t.team == p.team
+                or (champs_only and not isinstance(t, Pokemon))
+                or (isinstance(t, Pokemon) and (t.untargetable_until > self.time or t.submerged))):
+            return 0
+        e = self._lock_seen.get(p.id)
+        return 2 if e is not None and e[0] == t.id and self.time - e[1] <= self.LOCK_GRACE else 0
+
+    def _chase_ghost(self, p, t, dt: float) -> None:
+        if self._within_attack(p, t):
+            p.stop()
+            self._face(p, t)
+        else:
+            self._chase(p, t, dt)
 
     # --- bersagli mollati / irraggiungibili ----------------------------------------
     CHASE_SKIP_TIME = 6.0     # s: da fermo non si reinsegue chi si e' mollato
@@ -1000,6 +1047,8 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
         if not use_astar or self.world.grid.line_of_sight(u.pos.x, u.pos.y,
                                                            dest.x, dest.y, bb):
             u.set_path([dest])
+            if isinstance(u, Pokemon) and not u.is_bot:   # solo il giocatore: i bot restano
+                self._ai.setdefault(u.id, {})["astar_cd"] = 0.0   # al prossimo ostacolo A* subito
             return
         self._astar_move(u, dest, dt, bb)
 
@@ -1008,7 +1057,8 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
         dall'IA dei minion in Rust."""
         st = self._ai.setdefault(u.id, {})
         st["astar_cd"] = st.get("astar_cd", 0.0) - dt
-        if st["astar_cd"] <= 0.0:
+        recomputed = st["astar_cd"] <= 0.0
+        if recomputed:
             st["astar_cd"] = 0.3  # ricalcola A* al massimo ~3 volte/s
             start = (int(u.pos.x), int(u.pos.y))
             goal = (int(dest.x), int(dest.y))
@@ -1023,6 +1073,9 @@ class Match(*LINE_MIXINS, BasicAttackMixin, SmiteMixin, ItemEffectsMixin, BotPla
                                 (dest.x, dest.y), bb)
             st["astar_path"] = [Vec2(px, py) for (px, py) in pts]
         wps = st.get("astar_path") or [dest]
+        if isinstance(u, Pokemon) and not u.is_bot and not recomputed and u.path:
+            return        # il percorso in corso si segue: rimetterlo intero riporterebbe
+                          # indietro i waypoint gia' raggiunti (avanti-indietro)
         u.set_path(wps)
 
     def forget_path(self, u) -> None:
